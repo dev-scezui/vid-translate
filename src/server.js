@@ -9,6 +9,7 @@ import { FORMATS } from "./lib/subtitles.js";
 import {
   createUser, getJobForUser, getUsage, getUserByEmail, getUserById,
   listJobsForUser, rotateApiKey, setPlan, supabase,
+  deleteHistory, getHistoryItem, listHistory,
 } from "./store.js";
 import { requireAdmin, requireUser } from "./auth.js";
 import { billingRouter } from "./billing.js";
@@ -150,6 +151,55 @@ app.get("/api/jobs/:id", requireUser, async (req, res) => {
   const job = /^[0-9a-f-]{36}$/i.test(req.params.id) && (await getJobForUser(req.params.id, req.user.id));
   if (!job) return res.status(404).json({ error: "Job not found" });
   res.json(job);
+});
+
+// ---- Translation history (plans with history_days only) ---------------------
+
+/** Lock history behind a plan that includes it. Rows of downgraded users are kept until they expire. */
+async function requireHistory(req, res, next) {
+  const usage = await getUsage(req.user.id);
+  if (!usage.historyDays) {
+    return res.status(402).json({
+      error: `Translation history isn't included in the ${usage.planName} plan. Upgrade to keep your translations.`,
+      upgrade: true,
+    });
+  }
+  next();
+}
+
+/** GET /api/history?limit=20&before=<createdAt> -> saved translations, newest first (no segments). */
+app.get("/api/history", requireUser, requireHistory, async (req, res) => {
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+  const before = req.query.before && !Number.isNaN(Date.parse(req.query.before)) ? new Date(req.query.before).toISOString() : undefined;
+  res.json(await listHistory(req.user.id, { limit, before }));
+});
+
+/** GET /api/history/:id -> one saved translation with segments; ?format=srt|vtt|txt&track=... downloads it. */
+app.get("/api/history/:id", requireUser, requireHistory, async (req, res) => {
+  const item = /^[0-9a-f-]{36}$/i.test(req.params.id) && (await getHistoryItem(req.user.id, req.params.id));
+  if (!item) return res.status(404).json({ error: "Not found (it may have expired)" });
+  const format = req.query.format ? String(req.query.format) : null;
+  const track = String(req.query.track ?? "translation");
+  if (format) {
+    if (!FORMATS[format]) return res.status(400).json({ error: "`format` must be srt, vtt or txt" });
+    if (!TRACKS.has(track)) return res.status(400).json({ error: "`track` must be translation, original or bilingual" });
+    const f = FORMATS[format];
+    res.attachment(fileName(item, f.ext, track)).type(`${f.mime}; charset=utf-8`);
+    return res.send(f.render(item.segments, track));
+  }
+  res.json(item);
+});
+
+/** Deleting is allowed on any plan, so downgraded users can still remove what was saved. */
+app.delete("/api/history/:id", requireUser, async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(404).json({ error: "Not found" });
+  const deleted = await deleteHistory(req.user.id, req.params.id);
+  if (!deleted) return res.status(404).json({ error: "Not found" });
+  res.status(204).end();
+});
+
+app.delete("/api/history", requireUser, async (req, res) => {
+  res.json({ deleted: await deleteHistory(req.user.id) });
 });
 
 // ---- Admin (Authorization: Bearer $ADMIN_TOKEN) -----------------------------

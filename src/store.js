@@ -42,7 +42,7 @@ const newApiKey = () => `vt_${crypto.randomBytes(24).toString("base64url")}`;
 // ---- Plans -----------------------------------------------------------------
 
 export const listPlans = () =>
-  q(supabase.from("plans").select("id, name, max_video_sec, monthly_translations, stripe_price_id").order("sort"));
+  q(supabase.from("plans").select("id, name, max_video_sec, monthly_translations, history_days, stripe_price_id").order("sort"));
 
 // ---- Users -----------------------------------------------------------------
 
@@ -131,3 +131,69 @@ export const applySubscription = (s) =>
       p_cancel_at_period_end: s.cancelAtPeriodEnd ?? false,
     }),
   );
+
+// ---- Translation history (paid plans) --------------------------------------
+
+/** Save a finished result for `days` days. */
+export const saveResult = (jobId, userId, result, days) =>
+  q(
+    supabase.from("job_results").insert({
+      job_id: jobId,
+      user_id: userId,
+      source_language: result.sourceLanguage ?? null,
+      target_language: result.targetLanguage,
+      segments: result.segments,
+      expires_at: new Date(Date.now() + days * 86400_000).toISOString(),
+    }),
+  );
+
+const HISTORY_COLUMNS = "job_id, source_language, target_language, created_at, expires_at, jobs(video, input)";
+
+function historyItem(row, withSegments) {
+  return {
+    id: row.job_id,
+    video: row.jobs?.video ?? null,
+    url: row.jobs?.input?.url ?? null,
+    sourceLanguage: row.source_language,
+    targetLanguage: row.target_language,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    ...(withSegments ? { segments: row.segments } : {}),
+  };
+}
+
+/** Newest first. `before` is an ISO timestamp cursor (the last item's createdAt). */
+export async function listHistory(userId, { limit = 20, before } = {}) {
+  let query = supabase
+    .from("job_results")
+    .select(HISTORY_COLUMNS)
+    .eq("user_id", userId)
+    .gt("expires_at", new Date().toISOString())
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (before) query = query.lt("created_at", before);
+  return (await q(query)).map((r) => historyItem(r, false));
+}
+
+export async function getHistoryItem(userId, jobId) {
+  const row = await q(
+    supabase
+      .from("job_results")
+      .select(`${HISTORY_COLUMNS}, segments`)
+      .eq("user_id", userId)
+      .eq("job_id", jobId)
+      .gt("expires_at", new Date().toISOString())
+      .maybeSingle(),
+  );
+  return row && historyItem(row, true);
+}
+
+/** Delete one saved result, or all of the user's when jobId is omitted. Returns how many were deleted. */
+export async function deleteHistory(userId, jobId) {
+  let query = supabase.from("job_results").delete().eq("user_id", userId);
+  if (jobId) query = query.eq("job_id", jobId);
+  const rows = await q(query.select("job_id"));
+  return rows.length;
+}
+
+export const purgeExpiredHistory = () => q(supabase.rpc("purge_expired_history"));

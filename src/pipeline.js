@@ -6,13 +6,14 @@ import { downloadMedia, getVideoInfo } from "./services/download.js";
 import { extractAudio, getDuration, splitForUpload } from "./services/audio.js";
 import { transcribe } from "./services/transcribe.js";
 import { translateSegments } from "./services/translate.js";
-import { failStaleJobs, reserveJob, updateJob } from "./store.js";
+import { failStaleJobs, purgeExpiredHistory, reserveJob, saveResult, updateJob } from "./store.js";
 
 /*
- * Transcripts and translations are never stored. A job's result exists only in
- * this server's memory until it is sent back on the request that started it.
- * The database only keeps job metadata (status, video title, duration) for
- * quotas and history.
+ * A job's result is sent back on the request that started it. On the Free plan
+ * it is never stored: it exists only in this server's memory until sent. On
+ * plans with history (plans.history_days), it is also saved to job_results for
+ * that many days so the user can reopen it. Job metadata (status, video title,
+ * duration) is always kept for quotas.
  *
  * If the client disconnects before the result is ready, the job is cancelled
  * and the translation is refunded (status 'error').
@@ -21,7 +22,10 @@ const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_JOBS ?? 2);
 const queue = [];
 let active = 0;
 
-setInterval(() => failStaleJobs().catch((err) => console.error("stale-job sweep failed:", err)), 10 * 60 * 1000).unref();
+setInterval(() => {
+  failStaleJobs().catch((err) => console.error("stale-job sweep failed:", err));
+  purgeExpiredHistory().catch((err) => console.error("history purge failed:", err));
+}, 10 * 60 * 1000).unref();
 
 /**
  * Reserve one translation from the user's quota (throws 402 when used up), then queue the job.
@@ -32,7 +36,7 @@ setInterval(() => failStaleJobs().catch((err) => console.error("stale-job sweep 
  */
 export async function createJob(user, input, { onStatus = () => {}, signal } = {}) {
   const id = crypto.randomUUID();
-  const { planName, maxVideoSec } = await reserveJob(user.id, id, { url: input.url, targetLanguage: input.targetLanguage });
+  const { planName, maxVideoSec, historyDays } = await reserveJob(user.id, id, { url: input.url, targetLanguage: input.targetLanguage });
   const limits = [maxVideoSec, config.maxDurationSec].filter(Boolean);
 
   let resolve, reject;
@@ -40,7 +44,7 @@ export async function createJob(user, input, { onStatus = () => {}, signal } = {
   result.catch(() => {}); // callers await it; avoid unhandled-rejection noise if they don't
 
   queue.push({
-    id, input, planName, onStatus, signal, resolve, reject,
+    id, userId: user.id, input, planName, historyDays, onStatus, signal, resolve, reject,
     maxVideoSec: limits.length ? Math.min(...limits) : null,
   });
   onStatus("queued");
@@ -97,14 +101,21 @@ async function runJob(job) {
     });
 
     if (signal?.aborted) throw Object.assign(new Error("Cancelled: the client disconnected"), { expected: true });
+    const result = { id: job.id, video, sourceLanguage: transcript.language, targetLanguage, segments };
     await updateJob(job.id, { status: "done", finished_at: new Date().toISOString() });
-    job.resolve({
-      id: job.id,
-      video,
-      sourceLanguage: transcript.language,
-      targetLanguage,
-      segments,
-    });
+
+    // Paid plans keep a copy in their history. A failed save doesn't fail the job.
+    result.history = null;
+    if (job.historyDays) {
+      try {
+        await saveResult(job.id, job.userId, result, job.historyDays);
+        result.history = { saved: true, expiresAt: new Date(Date.now() + job.historyDays * 86400_000).toISOString() };
+      } catch (err) {
+        console.error(`[job ${job.id}] could not save to history:`, err);
+        result.history = { saved: false };
+      }
+    }
+    job.resolve(result);
   } catch (err) {
     const cancelled = signal?.aborted;
     const message = cancelled ? "Cancelled: the client disconnected" : err.message;

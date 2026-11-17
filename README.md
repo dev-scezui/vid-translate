@@ -8,7 +8,11 @@ An Express API that takes a public video link (TikTok, YouTube, Instagram, Faceb
 4. **Translates** it line by line with Claude, keeping each line's timing
 5. **Returns** the result as timestamped text or as downloadable subtitles (`.srt`, `.vtt`, `.txt`)
 
-**Transcripts and translations are never stored.** The result goes back to the client on the request that asked for it, and then it's gone. The database keeps only job metadata (status, video title, duration) for usage limits and history.
+**Privacy by plan:**
+- **Free:** transcripts and translations are never stored. The result goes back on the request that asked for it, and then it's gone.
+- **Pro and Business:** each finished translation is also saved to the user's **history** for a set number of days, so they can reopen it and re-download subtitles. Users can delete items at any time.
+
+The database also keeps job metadata (status, video title, duration) for usage limits.
 
 ## Requirements
 
@@ -41,11 +45,11 @@ Open http://localhost:3000 for a simple web UI, or call the API.
 
 Every request to `/api/jobs` needs an API key. Each user is on a plan, and the plan sets two limits:
 
-| Plan | Longest video | Translations per month |
-|---|---|---|
-| `free` (the default at signup) | 3 min | 5 |
-| `pro` | 30 min | 200 |
-| `business` | 2 h | 2,000 |
+| Plan | Longest video | Translations per month | History |
+|---|---|---|---|
+| `free` (the default at signup) | 3 min | 5 | none (nothing stored) |
+| `pro` | 30 min | 200 | kept 90 days |
+| `business` | 2 h | 2,000 | kept 365 days |
 
 The tiers are rows in the `plans` table. Edit them in the Supabase table editor and the change takes effect immediately, with no deploy.
 
@@ -191,9 +195,19 @@ A comment line is sent every 15 seconds so proxies keep the connection open.
 
 If the client disconnects before the result is ready, the job is cancelled and the translation is refunded. Since nothing is stored, a dropped connection loses the result, so long videos are safer over the event stream. If a job fails, you get `422` with the error, and the translation is refunded.
 
+### History (Pro and Business)
+
+On plans with history (`plans.history_days`), a finished job is saved, and its result includes `"history": { "saved": true, "expiresAt": "…" }`. On plans without history, these endpoints return `402` with `"upgrade": true`.
+
+- `GET /api/history`: saved translations, newest first, without segments. Use `?limit=` (up to 100) and `?before=<createdAt of the last item>` to page through.
+- `GET /api/history/:id`: one item with its `segments`. Add `?format=srt|vtt|txt&track=…` to download it as a file.
+- `DELETE /api/history/:id`, or `DELETE /api/history` to delete everything. Deleting works on any plan, so users can remove their data after downgrading.
+
+Items expire after the plan's `history_days`, and every server deletes expired items every 10 minutes. If a user downgrades, their saved items are kept until they expire but locked. They come back if the user upgrades again. Change retention per plan in the `plans` table.
+
 ### `GET /api/jobs` and `GET /api/jobs/:id`
 
-Your job history, newest first (`?limit=` up to 100), and a single job. These return metadata only: URL, target language, status, video title, duration and error. They never include transcripts or translations.
+A log of every job on any plan, newest first (`?limit=` up to 100), and a single job. These return metadata only: URL, target language, status, video title, duration and error. Saved results are under `/api/history`.
 
 
 Only the user who created a job can read it.

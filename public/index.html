@@ -26,6 +26,16 @@
   .lines time { color:var(--muted); font-variant-numeric:tabular-nums; font-size:14px; padding-top:2px; }
   .lines .orig { color:var(--muted); font-size:14px; }
   .note { color:var(--muted); font-size:13px; margin:8px 0 0; }
+  #history h2 { margin-top:32px; }
+  .hist { list-style:none; margin:0; padding:0; }
+  .hist li { display:flex; gap:12px; align-items:center; padding:10px 0; border-top:1px solid var(--border); }
+  .hist li:first-child { border-top:none; }
+  .hist .meta { flex:1; min-width:0; }
+  .hist .title { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .hist .sub { color:var(--muted); font-size:13px; }
+  .hist button, .locked button, #history .more { font:inherit; padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:var(--card); color:var(--fg); cursor:pointer; }
+  .hist button.open { background:var(--accent); color:#fff; border:none; }
+  .locked { text-align:center; color:var(--muted); }
   .plans { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:12px; margin:16px 0; }
   .plan { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px; white-space:normal; margin:0; }
   .plan.current { border-color:var(--accent); }
@@ -54,6 +64,7 @@
   </form>
   <p class="status" id="status"></p>
   <div id="out"></div>
+  <div id="history" hidden></div>
 </main>
 <script type="module">
 import { FORMATS, formatClock } from "/lib/subtitles.js";
@@ -81,6 +92,54 @@ function showUsage(u) {
   if (sub) accountEl.append(smallButton("Manage billing", () => goTo("/api/billing/portal")));
   accountEl.append(smallButton("Sign out", () => { store.set(null); apiKey = null; refresh(); }));
   renderPlans();
+  if (historyEnabled !== Boolean(u.historyDays)) { historyEnabled = Boolean(u.historyDays); loadHistory(); }
+}
+
+// ---- History (paid plans) ----
+const historyEl = document.getElementById("history");
+let historyEnabled = null;
+function el(tag, props = {}, ...kids) { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; }
+async function loadHistory(before) {
+  historyEl.hidden = !apiKey;
+  if (!apiKey) return;
+  if (!historyEnabled) {
+    const upgrade = plans.find((p) => p.history_days && p.purchasable);
+    historyEl.replaceChildren(el("h2", { textContent: "History" }), el("section", { className: "locked" },
+      el("p", { textContent: "Keep every translation and re-download its subtitles anytime." + (upgrade ? ` Included with ${upgrade.name}.` : " Available on paid plans.") }),
+      ...(upgrade ? [el("button", { textContent: `Upgrade to ${upgrade.name}`, onclick: () => goTo("/api/billing/checkout", { plan: upgrade.id }) })] : [])));
+    return;
+  }
+  const r = await fetch("/api/history?limit=20" + (before ? "&before=" + encodeURIComponent(before) : ""), { headers: auth() });
+  if (!r.ok) { historyEl.replaceChildren(el("h2", { textContent: "History" }), el("p", { className: "note", textContent: (await r.json()).error })); return; }
+  const items = await r.json();
+  let list = historyEl.querySelector(".hist");
+  if (!before || !list) {
+    list = el("ul", { className: "hist" });
+    historyEl.replaceChildren(el("h2", { textContent: "History" }), el("section", {}, list));
+  }
+  historyEl.querySelector(".more")?.remove();
+  if (!before && !items.length) list.append(el("li", {}, el("span", { className: "sub", textContent: "Your translations will appear here." })));
+  for (const it of items) {
+    const sub = `${new Date(it.createdAt).toLocaleString()} · ${it.sourceLanguage ?? "?"} → ${it.targetLanguage}` + (it.video?.durationSec ? ` · ${formatClock(it.video.durationSec)}` : "");
+    const li = el("li", {},
+      el("div", { className: "meta" }, el("div", { className: "title", textContent: it.video?.title ?? it.url ?? "Untitled" }), el("div", { className: "sub", textContent: sub })),
+      el("button", { className: "open", textContent: "Open", onclick: () => openHistory(it.id) }),
+      el("button", { textContent: "Delete", onclick: async () => {
+        if (!confirm("Delete this translation from your history?")) return;
+        const d = await fetch("/api/history/" + it.id, { method: "DELETE", headers: auth() });
+        if (d.ok) li.remove();
+      } }));
+    list.append(li);
+  }
+  if (items.length === 20) historyEl.querySelector("section").append(el("button", { className: "more", textContent: "Load more", onclick: () => loadHistory(items.at(-1).createdAt) }));
+}
+async function openHistory(id) {
+  const r = await fetch("/api/history/" + id, { headers: auth() });
+  const j = await r.json();
+  if (!r.ok) { alert(j.error); return; }
+  statusEl.textContent = j.video?.title ?? "Saved translation";
+  out.replaceChildren(renderResult(j));
+  scrollTo({ top: out.offsetTop - 16, behavior: "smooth" });
 }
 let plans = [];
 function fmtPrice(p) {
@@ -95,7 +154,7 @@ function renderPlans() {
     const name = document.createElement("b"); name.textContent = p.name;
     const price = document.createElement("div"); price.className = "price"; price.textContent = p.price ? fmtPrice(p.price) : p.paid ? "" : "Free";
     const ul = document.createElement("ul");
-    for (const t of [`${p.monthly_translations} translations / month`, `Videos up to ${Math.round(p.max_video_sec / 60)} min`]) { const li = document.createElement("li"); li.textContent = t; ul.append(li); }
+    for (const t of [`${p.monthly_translations} translations / month`, `Videos up to ${Math.round(p.max_video_sec / 60)} min`, p.history_days ? `History kept ${p.history_days} days` : "No saved history"]) { const li = document.createElement("li"); li.textContent = t; ul.append(li); }
     card.append(name, price, ul);
     if (currentUsage?.plan === p.id) { const b = document.createElement("button"); b.textContent = "Current plan"; b.disabled = true; card.append(b); }
     else if (p.purchasable) {
@@ -113,7 +172,7 @@ if (params.get("checkout")) {
   history.replaceState(null, "", location.pathname);
   if (params.get("checkout") === "success") setTimeout(refresh, 4000);
 }
-fetch("/api/plans").then((r) => r.ok ? r.json() : []).then((p) => { plans = p; renderPlans(); }).catch(() => {});
+fetch("/api/plans").then((r) => r.ok ? r.json() : []).then((p) => { plans = p; renderPlans(); if (historyEnabled === false) loadHistory(); }).catch(() => {});
 async function refresh() {
   if (apiKey) {
     const r = await fetch("/api/me", { headers: auth() });
@@ -121,6 +180,7 @@ async function refresh() {
     store.set(null); apiKey = null;
   }
   accountEl.textContent = "Sign up for a free key to start translating."; signup.hidden = false; f.hidden = true; plansEl.hidden = true;
+  historyEl.hidden = true; historyEnabled = null; out.replaceChildren();
 }
 signup.onsubmit = async (e) => {
   e.preventDefault();
@@ -178,6 +238,7 @@ f.onsubmit = async (e) => {
     if (!result) throw new Error("The connection closed before the result arrived");
     statusEl.textContent = result.video?.title ?? "Done";
     out.append(renderResult(result));
+    if (result.history?.saved) loadHistory();
   } catch (err) { if (err.name !== "AbortError") statusEl.textContent = "Error: " + err.message; }
   finally { f.querySelector("button").disabled = false; controller = null; }
 };
@@ -230,7 +291,12 @@ function renderResult(result) {
   };
   track.onchange = draw; draw();
   const note = document.createElement("p"); note.className = "note";
-  note.textContent = "We don't store transcripts or translations. Download or copy them before leaving this page.";
+  const savedUntil = result.history?.saved ? result.history.expiresAt : result.expiresAt;
+  note.textContent = savedUntil
+    ? `Saved in your history until ${new Date(savedUntil).toLocaleDateString()}.`
+    : result.history?.saved === false
+      ? "This one couldn't be saved to your history. Download or copy it before leaving this page."
+      : "Your plan doesn't save translations. Download or copy them before leaving this page.";
   section.append(bar, list, note);
   return section;
 }
