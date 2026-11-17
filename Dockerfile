@@ -10,5 +10,8 @@ RUN npm ci --omit=dev
 COPY . .
 ENV NODE_ENV=production
 EXPOSE 3000
+
+RUN mkdir -p /app/data && chown node:node /app/data
+VOLUME /app/data
 USER node
-CMD ["node", "src/server.js"]
+CMD ["node", "--disable-warning=ExperimentalWarning", "src/server.js"]

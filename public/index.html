@@ -9,6 +9,7 @@
   @media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#121212; --muted:#999; --card:#1d1d1d; --border:#333; --accent:#7aa2ff; } }
   body { margin:0; font:16px/1.5 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
   main { max-width:760px; margin:0 auto; padding:32px 16px; }
+  [hidden] { display:none !important; }
   form { display:flex; flex-wrap:wrap; gap:8px; }
   input, button { font:inherit; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--card); color:var(--fg); }
   input[name=url] { flex:1 1 320px; } input[name=lang] { width:140px; }
@@ -22,7 +23,13 @@
 <main>
   <h1>Video Translate</h1>
   <p class="status">Paste a public link from TikTok, YouTube, Instagram, Facebook, Threads, X and more.</p>
-  <form id="f">
+  <div id="account" class="status"></div>
+  <form id="signup" hidden>
+    <input name="email" type="email" placeholder="you@example.com" required>
+    <button>Get free API key</button>
+    <input name="key" placeholder="…or paste an existing key" aria-label="API key">
+  </form>
+  <form id="f" hidden>
     <input name="url" type="url" placeholder="https://..." required>
     <input name="lang" value="English" aria-label="Target language">
     <button>Translate</button>
@@ -31,26 +38,58 @@
   <div id="out"></div>
 </main>
 <script>
+const KEY = "vt_api_key";
+const store = { get() { try { return localStorage.getItem(KEY); } catch { return null; } },
+                set(v) { try { v ? localStorage.setItem(KEY, v) : localStorage.removeItem(KEY); } catch {} } };
+let apiKey = store.get();
+const accountEl = document.getElementById("account"), signup = document.getElementById("signup");
+const auth = () => ({ Authorization: "Bearer " + apiKey });
+function showUsage(u) {
+  accountEl.textContent = `${u.planName} plan · ${u.remaining}/${u.monthlyTranslations} translations left this month · videos up to ${Math.round(u.maxVideoSec / 60)} min `;
+  const out = document.createElement("button"); out.textContent = "Sign out"; out.style.padding = "2px 8px";
+  out.onclick = () => { store.set(null); apiKey = null; refresh(); }; accountEl.append(out);
+}
+async function refresh() {
+  if (apiKey) {
+    const r = await fetch("/api/me", { headers: auth() });
+    if (r.ok) { showUsage((await r.json()).usage); signup.hidden = true; f.hidden = false; return; }
+    store.set(null); apiKey = null;
+  }
+  accountEl.textContent = "Sign up for a free key to start translating."; signup.hidden = false; f.hidden = true;
+}
+signup.onsubmit = async (e) => {
+  e.preventDefault();
+  if (signup.key.value.trim()) { apiKey = signup.key.value.trim(); }
+  else {
+    const r = await fetch("/api/signup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: signup.email.value }) });
+    const j = await r.json(); if (!r.ok) { accountEl.textContent = "Error: " + j.error; return; }
+    apiKey = j.apiKey; alert("Your API key (also saved in this browser):\n\n" + apiKey);
+  }
+  store.set(apiKey); refresh();
+};
+signup.email.required = false;
 const f = document.getElementById("f"), statusEl = document.getElementById("status"), out = document.getElementById("out");
 const labels = { queued:"Queued…", fetching_info:"Reading link…", downloading:"Downloading…", extracting_audio:"Extracting audio…", transcribing:"Transcribing…", translating:"Translating…" };
 function card(title, text) { const s = document.createElement("section"); const h = document.createElement("h2"); h.textContent = title; s.append(h, text); return s; }
 f.onsubmit = async (e) => {
   e.preventDefault(); out.innerHTML = ""; f.querySelector("button").disabled = true;
   try {
-    let r = await fetch("/api/jobs", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ url: f.url.value, targetLanguage: f.lang.value }) });
+    let r = await fetch("/api/jobs", { method:"POST", headers:{ "Content-Type":"application/json", ...auth() }, body: JSON.stringify({ url: f.url.value, targetLanguage: f.lang.value }) });
     let job = await r.json(); if (!r.ok) throw new Error(job.error);
+    if (job.usage) showUsage(job.usage);
     while (!["done","error"].includes(job.status)) {
       statusEl.textContent = labels[job.status] ?? job.status;
       await new Promise((res) => setTimeout(res, 2000));
-      job = await (await fetch("/api/jobs/" + job.id)).json();
+      job = await (await fetch("/api/jobs/" + job.id, { headers: auth() })).json();
     }
     if (job.status === "error") throw new Error(job.error);
     statusEl.textContent = job.video?.title ?? "Done";
     out.append(card("Translation (" + job.translation.language + ")", job.translation.text),
                card("Original transcript" + (job.transcript.language ? " (" + job.transcript.language + ")" : ""), job.transcript.text));
   } catch (err) { statusEl.textContent = "Error: " + err.message; }
-  finally { f.querySelector("button").disabled = false; }
+  finally { f.querySelector("button").disabled = false; refresh(); }
 };
+refresh();
 </script>
 </body>
 </html>

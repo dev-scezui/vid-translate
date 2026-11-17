@@ -9,7 +9,7 @@ An Express API that takes a public video link (TikTok, YouTube, Instagram, Faceb
 
 ## Requirements
 
-- Node.js 20+
+- Node.js 22.13+ (uses the built-in `node:sqlite`)
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp#installation) and `ffmpeg` on `PATH`. Keep yt-dlp updated (`yt-dlp -U`): sites change often.
 - An Anthropic API key (for translation) and a speech-to-text API key (for transcription)
 
@@ -19,13 +19,49 @@ Or skip the local installs and use Docker: `docker build -t vid-translate . && d
 
 ```bash
 npm install
-cp .env.example .env   # fill in ANTHROPIC_API_KEY and TRANSCRIBE_API_KEY
+cp .env.example .env   # fill in ANTHROPIC_API_KEY, TRANSCRIBE_API_KEY and ADMIN_TOKEN
 npm run dev
 ```
 
 Open http://localhost:3000 for a simple web UI, or call the API.
 
+## Plans and limits
+
+Every request to `/api/jobs` needs an API key. Each user is on a plan, and the plan sets two limits:
+
+| Plan | Longest video | Translations per month |
+|---|---|---|
+| `free` (the default at signup) | 3 min | 5 |
+| `pro` | 30 min | 200 |
+| `business` | 2 h | 2,000 |
+
+Edit `src/plans.js` to change the tiers.
+
+- **Monthly count:** a translation is reserved when the job starts. If the job fails for any reason (a bad link, a video over the length limit, a download or API error), the translation is refunded. Counts reset on the 1st of each month (UTC). Once a user runs out, `POST /api/jobs` returns `402` with their usage.
+- **Video length:** checked from the site's metadata before downloading. If the site doesn't report a length, it's checked again on the extracted audio, before any paid transcription.
+- **Storage:** users and usage live in SQLite (`data/vid-translate.db`, or set `DATABASE_PATH`). API keys are stored as hashes only.
+- **Upgrades:** there's no payment integration yet. Change a user's plan with the admin endpoint below, or call `setPlan()` from a payment webhook (for example Stripe).
+- **Signup abuse:** limited to 3 signups per IP per day. Set `TRUST_PROXY` when running behind a proxy so the real client IP is used.
+
 ## API
+
+Send the key as `Authorization: Bearer vt_...` (or `X-API-Key`).
+
+### `POST /api/signup`
+
+`{ "email": "you@example.com" }` returns `201` with `{ apiKey, user, usage }`. The key is shown only once.
+
+### `GET /api/me`
+
+Shows your plan and usage: `used`, `remaining`, `maxVideoSec`, `minutesProcessed`, `resetsAt`.
+
+### `POST /api/me/rotate-key`
+
+Issues a new key. The old key stops working.
+
+### `GET /api/plans`
+
+Lists the plans and their limits.
 
 ### `POST /api/jobs`
 
@@ -41,6 +77,7 @@ The response is `202` with a job to poll. Add `?wait=true` to block until the jo
 ```bash
 curl -X POST 'localhost:3000/api/jobs?wait=true' \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
   -d '{"url":"https://youtu.be/jNQXAC9IVRw","targetLanguage":"Spanish"}'
 ```
 
@@ -59,7 +96,14 @@ curl -X POST 'localhost:3000/api/jobs?wait=true' \
 }
 ```
 
-Jobs live in memory and expire an hour after they finish.
+Only the user who created a job can read it. Jobs live in memory and expire an hour after they finish. Usage records are kept permanently in the database.
+
+### Admin endpoints
+
+These need `Authorization: Bearer $ADMIN_TOKEN`.
+
+- `GET /api/admin/users?email=...` looks up a user and their usage.
+- `POST /api/admin/users/:id/plan` with `{ "plan": "pro" }` changes a user's plan.
 
 ### `GET /health`
 
@@ -76,7 +120,9 @@ See `.env.example`. The main settings:
 | `TRANSCRIBE_MODEL` | `whisper-1` | Whisper models also return timestamps |
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Translation model |
 | `CLAUDE_EFFORT` | `medium` | `low` is cheaper and faster for casual clips |
-| `MAX_DURATION_SEC` | `3600` | Rejects longer videos |
+| `ADMIN_TOKEN` | (none) | Required for the admin endpoints |
+| `DATABASE_PATH` | `./data/vid-translate.db` | |
+| `MAX_DURATION_SEC` | `3600` | A global cap on video length, applied on top of each plan's limit |
 | `MAX_CONCURRENT_JOBS` | `2` | |
 | `YT_DLP_COOKIES` | (none) | A cookies.txt file, which helps with Instagram and Facebook |
 
