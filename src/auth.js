@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { getUserByApiKey } from "./accounts.js";
+import { getUserByApiKey } from "./store.js";
 
 function bearer(req) {
   const h = req.get("authorization") ?? "";
@@ -7,12 +7,16 @@ function bearer(req) {
 }
 
 /** Require a valid user API key; sets req.user. */
-export function requireUser(req, res, next) {
-  const key = bearer(req);
-  const user = key && getUserByApiKey(key);
-  if (!user) return res.status(401).json({ error: "Missing or invalid API key. Sign up at POST /api/signup." });
-  req.user = user;
-  next();
+export async function requireUser(req, res, next) {
+  try {
+    const key = bearer(req);
+    const user = key && (await getUserByApiKey(key));
+    if (!user) return res.status(401).json({ error: "Missing or invalid API key. Sign up at POST /api/signup." });
+    req.user = user;
+    next();
+  } catch (err) {
+    next(err);
+  }
 }
 
 /** Require the ADMIN_TOKEN from the environment. */
@@ -25,16 +29,4 @@ export function requireAdmin(req, res, next) {
     crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected));
   if (!ok) return res.status(401).json({ error: "Admin token required" });
   next();
-}
-
-/** Tiny fixed-window per-IP limiter, enough to slow down signup spam on a single instance. */
-export function ipRateLimit({ max, windowMs }) {
-  const hits = new Map();
-  setInterval(() => hits.clear(), windowMs).unref();
-  return (req, res, next) => {
-    const n = (hits.get(req.ip) ?? 0) + 1;
-    hits.set(req.ip, n);
-    if (n > max) return res.status(429).json({ error: "Too many requests, try again later" });
-    next();
-  };
 }

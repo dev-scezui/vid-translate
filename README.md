@@ -9,17 +9,26 @@ An Express API that takes a public video link (TikTok, YouTube, Instagram, Faceb
 
 ## Requirements
 
-- Node.js 22.13+ (uses the built-in `node:sqlite`)
+- Node.js 20+
+- A [Supabase](https://supabase.com) project (the free tier is fine to start)
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp#installation) and `ffmpeg` on `PATH`. Keep yt-dlp updated (`yt-dlp -U`): sites change often.
 - An Anthropic API key (for translation) and a speech-to-text API key (for transcription)
 
 Or skip the local installs and use Docker: `docker build -t vid-translate . && docker run --env-file .env -p 3000:3000 vid-translate`
 
+## Supabase setup
+
+1. Create a project at supabase.com.
+2. Apply the schema in `supabase/migrations/`. Either paste the file into the dashboard's **SQL Editor** and run it, or use the CLI: `supabase link --project-ref <ref> && supabase db push`. It's safe to run more than once.
+3. Copy the **Project URL** and the **service_role** key (Project Settings → API) into `.env` as `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
+
+The service-role key bypasses row-level security, so keep it on the server only. The tables have RLS turned on with no policies, so the public `anon` key can't read or write anything.
+
 ## Run
 
 ```bash
 npm install
-cp .env.example .env   # fill in ANTHROPIC_API_KEY, TRANSCRIBE_API_KEY and ADMIN_TOKEN
+cp .env.example .env   # fill in the Supabase, Anthropic and transcription keys, plus ADMIN_TOKEN
 npm run dev
 ```
 
@@ -35,13 +44,25 @@ Every request to `/api/jobs` needs an API key. Each user is on a plan, and the p
 | `pro` | 30 min | 200 |
 | `business` | 2 h | 2,000 |
 
-Edit `src/plans.js` to change the tiers.
+The tiers are rows in the `plans` table. Edit them in the Supabase table editor and the change takes effect immediately, with no deploy.
 
 - **Monthly count:** a translation is reserved when the job starts. If the job fails for any reason (a bad link, a video over the length limit, a download or API error), the translation is refunded. Counts reset on the 1st of each month (UTC). Once a user runs out, `POST /api/jobs` returns `402` with their usage.
 - **Video length:** checked from the site's metadata before downloading. If the site doesn't report a length, it's checked again on the extracted audio, before any paid transcription.
-- **Storage:** users and usage live in SQLite (`data/vid-translate.db`, or set `DATABASE_PATH`). API keys are stored as hashes only.
-- **Upgrades:** there's no payment integration yet. Change a user's plan with the admin endpoint below, or call `setPlan()` from a payment webhook (for example Stripe).
-- **Signup abuse:** limited to 3 signups per IP per day. Set `TRUST_PROXY` when running behind a proxy so the real client IP is used.
+- **Storage:** users, plans and jobs live in Supabase. API keys are stored as hashes only. The `jobs` table doubles as the usage ledger: every job that didn't end in `error` counts toward the monthly limit.
+- **Atomic checks:** the quota check and the signup limit run inside Postgres functions with row and advisory locks. They stay correct however many app servers you run. In a test, 20 simultaneous requests from a Free user produced exactly 5 jobs.
+- **Upgrades:** there's no payment integration yet. Change a user's plan with the admin endpoint below, in the Supabase table editor, or by calling `setPlan()` from a payment webhook (for example Stripe).
+- **Signup abuse:** limited to 3 signups per IP per day, enforced in the database. Set `TRUST_PROXY` when running behind a load balancer so the real client IP is used.
+
+## Scaling
+
+The app servers keep no state, so you can run as many as you like behind a load balancer:
+
+- Job status and results are in the database, so any server can answer `GET /api/jobs/:id`.
+- Each server processes the jobs it accepted, up to `MAX_CONCURRENT_JOBS` at a time, using its local disk for temporary files.
+- If a server dies mid-job, a sweep marks the job as failed (which refunds the translation) once it has made no progress for an hour. Every server runs the sweep every 10 minutes, and running it more than once is harmless.
+- `?wait=true` keeps the HTTP request open on the server running the job. For long videos, polling is more robust.
+
+For heavy traffic, the next step is to split API servers from worker servers, with a proper queue between them (for example pg-boss on the same Postgres, or BullMQ with Redis), so a burst of jobs doesn't slow down API responses.
 
 ## API
 
@@ -81,6 +102,10 @@ curl -X POST 'localhost:3000/api/jobs?wait=true' \
   -d '{"url":"https://youtu.be/jNQXAC9IVRw","targetLanguage":"Spanish"}'
 ```
 
+### `GET /api/jobs`
+
+Your recent jobs, newest first. Use `?limit=` to get up to 100.
+
 ### `GET /api/jobs/:id`
 
 `status` moves through `queued` → `fetching_info` → `downloading` → `extracting_audio` → `transcribing` → `translating` → `done`, or ends at `error`.
@@ -96,7 +121,7 @@ curl -X POST 'localhost:3000/api/jobs?wait=true' \
 }
 ```
 
-Only the user who created a job can read it. Jobs live in memory and expire an hour after they finish. Usage records are kept permanently in the database.
+Only the user who created a job can read it. Jobs, including their transcripts and translations, are stored permanently. Add a cleanup job if you'd rather not keep results forever.
 
 ### Admin endpoints
 
@@ -121,7 +146,7 @@ See `.env.example`. The main settings:
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Translation model |
 | `CLAUDE_EFFORT` | `medium` | `low` is cheaper and faster for casual clips |
 | `ADMIN_TOKEN` | (none) | Required for the admin endpoints |
-| `DATABASE_PATH` | `./data/vid-translate.db` | |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | (none) | Required |
 | `MAX_DURATION_SEC` | `3600` | A global cap on video length, applied on top of each plan's limit |
 | `MAX_CONCURRENT_JOBS` | `2` | |
 | `YT_DLP_COOKIES` | (none) | A cookies.txt file, which helps with Instagram and Facebook |

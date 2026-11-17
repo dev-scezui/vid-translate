@@ -6,50 +6,34 @@ import { downloadMedia, getVideoInfo } from "./services/download.js";
 import { extractAudio, getDuration, splitForUpload } from "./services/audio.js";
 import { transcribe } from "./services/transcribe.js";
 import { translate } from "./services/translate.js";
-import { completeTranslation, refundTranslation, reserveTranslation } from "./accounts.js";
-import { getPlan } from "./plans.js";
+import { failStaleJobs, reserveJob, updateJob } from "./store.js";
 
-const JOB_TTL_MS = 60 * 60 * 1000;
+/*
+ * Job state lives in the database, so any app server can answer
+ * GET /api/jobs/:id. Each server runs the jobs it accepted, with at most
+ * MAX_CONCURRENT_JOBS at once. If a server dies mid-job, the stale-job sweep
+ * marks it failed, which also refunds the user's quota.
+ */
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_JOBS ?? 2);
-
-/** In-memory job store. Swap for Redis/a DB if you run more than one instance. */
-const jobs = new Map();
 const queue = [];
+const waiters = new Map(); // jobId -> resolve(), for ?wait=true on this server
 let active = 0;
 
-export function getJob(id) {
-  return jobs.get(id);
-}
+setInterval(() => failStaleJobs().catch((err) => console.error("stale-job sweep failed:", err)), 10 * 60 * 1000).unref();
 
-/** Reserves one translation from the user's quota (throws 402 if none left), then queues the job. */
-export function createJob(user, { url, targetLanguage, sourceLanguage }) {
+/**
+ * Reserve one translation from the user's quota (throws 402 when used up), then queue the job.
+ * @returns {Promise<{id: string, done: Promise<void>}>}
+ */
+export async function createJob(user, input) {
   const id = crypto.randomUUID();
-  reserveTranslation(user, id);
+  const { planName, maxVideoSec } = await reserveJob(user.id, id, input);
+  const limits = [maxVideoSec, config.maxDurationSec].filter(Boolean);
 
-  const plan = getPlan(user.plan);
-  const limits = [plan.maxVideoSec, config.maxDurationSec].filter(Boolean);
-  const job = {
-    id,
-    userId: user.id,
-    maxVideoSec: limits.length ? Math.min(...limits) : null,
-    planName: plan.name,
-    status: "queued",
-    input: { url, targetLanguage, sourceLanguage: sourceLanguage ?? null },
-    video: null,
-    transcript: null,
-    translation: null,
-    error: null,
-    createdAt: new Date().toISOString(),
-    finishedAt: null,
-  };
-  let resolveDone;
-  job.done = new Promise((r) => (resolveDone = r));
-  job.resolveDone = resolveDone;
-
-  jobs.set(job.id, job);
-  queue.push(job);
+  const done = new Promise((resolve) => waiters.set(id, resolve));
+  queue.push({ id, input, planName, maxVideoSec: limits.length ? Math.min(...limits) : null });
   pump();
-  return job;
+  return { id, done };
 }
 
 function pump() {
@@ -58,9 +42,8 @@ function pump() {
     active++;
     runJob(job).finally(() => {
       active--;
-      job.finishedAt = new Date().toISOString();
-      job.resolveDone(job);
-      setTimeout(() => jobs.delete(job.id), JOB_TTL_MS).unref();
+      waiters.get(job.id)?.();
+      waiters.delete(job.id);
       pump();
     });
   }
@@ -69,41 +52,39 @@ function pump() {
 async function runJob(job) {
   const dir = path.join(config.tmpDir, job.id);
   const { url, targetLanguage, sourceLanguage } = job.input;
+  const step = (status, extra = {}) => updateJob(job.id, { status, ...extra });
   try {
-    job.status = "fetching_info";
-    job.video = await getVideoInfo(url);
-    checkLength(job, job.video.durationSec);
+    await step("fetching_info");
+    const video = await getVideoInfo(url);
+    checkLength(job, video.durationSec);
 
-    job.status = "downloading";
+    await step("downloading", { video });
     const media = await downloadMedia(url, dir);
 
-    job.status = "extracting_audio";
+    await step("extracting_audio");
     const audio = await extractAudio(media, dir);
-    // Some sites don't report a duration up front; measure the audio instead.
-    job.video.durationSec ??= await getDuration(audio);
-    checkLength(job, job.video.durationSec);
     await fs.rm(media, { force: true });
+    // Some sites don't report a duration up front; measure the audio instead.
+    video.durationSec ??= await getDuration(audio);
+    checkLength(job, video.durationSec);
 
-    job.status = "transcribing";
+    await step("transcribing", { video, duration_sec: video.durationSec });
     const chunks = await splitForUpload(audio, dir, config.transcription.maxUploadBytes);
-    job.transcript = await transcribe(chunks, { language: sourceLanguage ?? undefined });
+    const transcript = await transcribe(chunks, { language: sourceLanguage ?? undefined });
 
-    job.status = "translating";
-    job.translation = {
-      language: targetLanguage,
-      text: await translate(job.transcript.text, {
-        targetLanguage,
-        sourceLanguage: sourceLanguage ?? job.transcript.language ?? undefined,
-      }),
-    };
+    await step("translating", { transcript });
+    const text = await translate(transcript.text, {
+      targetLanguage,
+      sourceLanguage: sourceLanguage ?? transcript.language ?? undefined,
+    });
 
-    job.status = "done";
-    completeTranslation(job.id, job.video.durationSec);
+    await step("done", { translation: { language: targetLanguage, text }, finished_at: new Date().toISOString() });
   } catch (err) {
     if (!err.expected) console.error(`[job ${job.id}]`, err);
-    job.status = "error";
-    job.error = err.message;
-    refundTranslation(job.id);
+    // Status 'error' refunds the translation (it no longer counts against the quota).
+    await step("error", { error: err.message, finished_at: new Date().toISOString() }).catch((e) =>
+      console.error(`[job ${job.id}] could not record failure:`, e),
+    );
   } finally {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
@@ -117,10 +98,4 @@ function checkLength(job, durationSec) {
       { expected: true },
     );
   }
-}
-
-/** Public view of a job (drops internal fields). */
-export function serializeJob(job) {
-  const { done, resolveDone, userId, maxVideoSec, planName, ...rest } = job;
-  return rest;
 }
