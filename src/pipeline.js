@@ -5,35 +5,47 @@ import { config } from "./config.js";
 import { downloadMedia, getVideoInfo } from "./services/download.js";
 import { extractAudio, getDuration, splitForUpload } from "./services/audio.js";
 import { transcribe } from "./services/transcribe.js";
-import { translate } from "./services/translate.js";
+import { translateSegments } from "./services/translate.js";
 import { failStaleJobs, reserveJob, updateJob } from "./store.js";
 
 /*
- * Job state lives in the database, so any app server can answer
- * GET /api/jobs/:id. Each server runs the jobs it accepted, with at most
- * MAX_CONCURRENT_JOBS at once. If a server dies mid-job, the stale-job sweep
- * marks it failed, which also refunds the user's quota.
+ * Transcripts and translations are never stored. A job's result exists only in
+ * this server's memory until it is sent back on the request that started it.
+ * The database only keeps job metadata (status, video title, duration) for
+ * quotas and history.
+ *
+ * If the client disconnects before the result is ready, the job is cancelled
+ * and the translation is refunded (status 'error').
  */
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_JOBS ?? 2);
 const queue = [];
-const waiters = new Map(); // jobId -> resolve(), for ?wait=true on this server
 let active = 0;
 
 setInterval(() => failStaleJobs().catch((err) => console.error("stale-job sweep failed:", err)), 10 * 60 * 1000).unref();
 
 /**
  * Reserve one translation from the user's quota (throws 402 when used up), then queue the job.
- * @returns {Promise<{id: string, done: Promise<void>}>}
+ * @param {object} user
+ * @param {{url: string, targetLanguage: string, sourceLanguage: string|null}} input
+ * @param {{onStatus?: (status: string, info?: object) => void, signal?: AbortSignal}} hooks
+ * @returns {Promise<{id: string, result: Promise<object>}>} result rejects if the job fails.
  */
-export async function createJob(user, input) {
+export async function createJob(user, input, { onStatus = () => {}, signal } = {}) {
   const id = crypto.randomUUID();
-  const { planName, maxVideoSec } = await reserveJob(user.id, id, input);
+  const { planName, maxVideoSec } = await reserveJob(user.id, id, { url: input.url, targetLanguage: input.targetLanguage });
   const limits = [maxVideoSec, config.maxDurationSec].filter(Boolean);
 
-  const done = new Promise((resolve) => waiters.set(id, resolve));
-  queue.push({ id, input, planName, maxVideoSec: limits.length ? Math.min(...limits) : null });
+  let resolve, reject;
+  const result = new Promise((res, rej) => ((resolve = res), (reject = rej)));
+  result.catch(() => {}); // callers await it; avoid unhandled-rejection noise if they don't
+
+  queue.push({
+    id, input, planName, onStatus, signal, resolve, reject,
+    maxVideoSec: limits.length ? Math.min(...limits) : null,
+  });
+  onStatus("queued");
   pump();
-  return { id, done };
+  return { id, result };
 }
 
 function pump() {
@@ -42,8 +54,6 @@ function pump() {
     active++;
     runJob(job).finally(() => {
       active--;
-      waiters.get(job.id)?.();
-      waiters.delete(job.id);
       pump();
     });
   }
@@ -52,39 +62,58 @@ function pump() {
 async function runJob(job) {
   const dir = path.join(config.tmpDir, job.id);
   const { url, targetLanguage, sourceLanguage } = job.input;
-  const step = (status, extra = {}) => updateJob(job.id, { status, ...extra });
+  const { signal } = job;
+  const step = async (status, meta = {}) => {
+    if (signal?.aborted) throw Object.assign(new Error("Cancelled: the client disconnected"), { expected: true });
+    job.onStatus(status, meta);
+    await updateJob(job.id, { status, ...meta });
+  };
+
   try {
     await step("fetching_info");
-    const video = await getVideoInfo(url);
+    const video = await getVideoInfo(url, signal);
     checkLength(job, video.durationSec);
 
     await step("downloading", { video });
-    const media = await downloadMedia(url, dir);
+    const media = await downloadMedia(url, dir, signal);
 
     await step("extracting_audio");
-    const audio = await extractAudio(media, dir);
+    const audio = await extractAudio(media, dir, signal);
     await fs.rm(media, { force: true });
-    // Some sites don't report a duration up front; measure the audio instead.
-    video.durationSec ??= await getDuration(audio);
+    const audioSec = await getDuration(audio);
+    // Some sites don't report a duration up front; use the audio's length instead.
+    video.durationSec ??= audioSec;
     checkLength(job, video.durationSec);
 
     await step("transcribing", { video, duration_sec: video.durationSec });
-    const chunks = await splitForUpload(audio, dir, config.transcription.maxUploadBytes);
-    const transcript = await transcribe(chunks, { language: sourceLanguage ?? undefined });
+    const chunks = await splitForUpload(audio, dir, config.transcription.maxUploadBytes, audioSec, signal);
+    const transcript = await transcribe(chunks, { language: sourceLanguage ?? undefined, signal });
 
-    await step("translating", { transcript });
-    const text = await translate(transcript.text, {
+    await step("translating");
+    const segments = await translateSegments(transcript.segments, {
       targetLanguage,
       sourceLanguage: sourceLanguage ?? transcript.language ?? undefined,
+      signal,
     });
 
-    await step("done", { translation: { language: targetLanguage, text }, finished_at: new Date().toISOString() });
+    if (signal?.aborted) throw Object.assign(new Error("Cancelled: the client disconnected"), { expected: true });
+    await updateJob(job.id, { status: "done", finished_at: new Date().toISOString() });
+    job.resolve({
+      id: job.id,
+      video,
+      sourceLanguage: transcript.language,
+      targetLanguage,
+      segments,
+    });
   } catch (err) {
-    if (!err.expected) console.error(`[job ${job.id}]`, err);
+    const cancelled = signal?.aborted;
+    const message = cancelled ? "Cancelled: the client disconnected" : err.message;
+    if (!err.expected && !cancelled) console.error(`[job ${job.id}]`, err);
     // Status 'error' refunds the translation (it no longer counts against the quota).
-    await step("error", { error: err.message, finished_at: new Date().toISOString() }).catch((e) =>
+    await updateJob(job.id, { status: "error", error: message, finished_at: new Date().toISOString() }).catch((e) =>
       console.error(`[job ${job.id}] could not record failure:`, e),
     );
+    job.reject(Object.assign(new Error(message), { status: 422 }));
   } finally {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }

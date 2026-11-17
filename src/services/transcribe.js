@@ -12,32 +12,42 @@ function getClient() {
 }
 
 /**
- * Transcribe audio chunks in order and stitch them together.
- * @param {{file: string, offsetSec: number}[]} chunks
- * @param {{language?: string}} opts ISO-639-1 hint, e.g. "es". Omit to auto-detect.
+ * Transcribe audio chunks in order and stitch them together, with timestamps.
+ * Timestamps need a model that supports response_format "verbose_json"
+ * (whisper-1, Groq's whisper-large-v3*, faster-whisper servers). Models
+ * without it (gpt-4o-*-transcribe) get one segment per audio chunk.
+ * @param {{file: string, offsetSec: number, durationSec: number}[]} chunks
+ * @param {{language?: string, signal?: AbortSignal}} opts language is an ISO-639-1 hint, e.g. "es".
+ * @returns {Promise<{text: string, language: string|null, segments: {start: number, end: number, text: string}[]}>}
  */
-export async function transcribe(chunks, { language } = {}) {
+export async function transcribe(chunks, { language, signal } = {}) {
   const openai = getClient();
   const { model } = config.transcription;
-  // whisper-1 (and Groq/faster-whisper servers) return timestamps + detected
-  // language with verbose_json; newer gpt-4o-*-transcribe models only do json.
-  const verbose = /whisper/i.test(model);
+  const verbose = !/gpt-4o.*transcribe/i.test(model);
 
   const texts = [];
   const segments = [];
   let detectedLanguage = language ?? null;
 
-  for (const { file, offsetSec } of chunks) {
-    const res = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(file),
-      model,
-      response_format: verbose ? "verbose_json" : "json",
-      ...(language ? { language } : {}),
-    });
+  for (const { file, offsetSec, durationSec } of chunks) {
+    const res = await openai.audio.transcriptions.create(
+      {
+        file: fs.createReadStream(file),
+        model,
+        response_format: verbose ? "verbose_json" : "json",
+        ...(verbose ? { timestamp_granularities: ["segment"] } : {}),
+        ...(language ? { language } : {}),
+      },
+      { signal },
+    );
     texts.push(res.text.trim());
     detectedLanguage ??= res.language ?? null;
-    for (const s of res.segments ?? []) {
-      segments.push({ start: s.start + offsetSec, end: s.end + offsetSec, text: s.text.trim() });
+    if (res.segments?.length) {
+      for (const s of res.segments) {
+        if (s.text.trim()) segments.push({ start: s.start + offsetSec, end: s.end + offsetSec, text: s.text.trim() });
+      }
+    } else if (res.text.trim()) {
+      segments.push({ start: offsetSec, end: offsetSec + durationSec, text: res.text.trim() });
     }
   }
 

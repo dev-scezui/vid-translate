@@ -12,8 +12,8 @@ function baseArgs() {
 }
 
 /** Fetch metadata without downloading (title, duration, platform). */
-export async function getVideoInfo(url) {
-  const out = await run(config.ytDlpPath, [...baseArgs(), "--dump-single-json", url], { timeoutMs: 2 * 60 * 1000 });
+export async function getVideoInfo(url, signal) {
+  const out = await run(config.ytDlpPath, [...baseArgs(), "--dump-single-json", url], { timeoutMs: 2 * 60 * 1000, signal });
   const info = JSON.parse(out);
   return {
     id: info.id,
@@ -29,7 +29,7 @@ export async function getVideoInfo(url) {
  * Download the media into `dir`. Prefers an audio-only stream (much smaller);
  * falls back to the full video when the site only serves muxed files.
  */
-export async function downloadMedia(url, dir) {
+export async function downloadMedia(url, dir, signal) {
   await fs.mkdir(dir, { recursive: true });
   const out = await run(config.ytDlpPath, [
     ...baseArgs(),
@@ -37,7 +37,7 @@ export async function downloadMedia(url, dir) {
     "-o", path.join(dir, "source.%(ext)s"),
     "--print", "after_move:filepath",
     url,
-  ]);
+  ], { signal });
   const file = out.trim().split("\n").pop();
   if (!file) throw new Error("yt-dlp did not report a downloaded file");
   return file;

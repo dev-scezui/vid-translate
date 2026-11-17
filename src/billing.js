@@ -126,6 +126,7 @@ billingRouter.get("/api/plans", async (_req, res) => {
   res.json(
     plans.map(({ stripe_price_id, ...p }) => ({
       ...p,
+      paid: Boolean(stripe_price_id),
       purchasable: Boolean(stripe && stripe_price_id),
       price: stripe_price_id ? prices.get(stripe_price_id) ?? null : null,
     })),

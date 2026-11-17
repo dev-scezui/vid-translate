@@ -19,7 +19,7 @@ export const supabase = createClient(url, key, {
 });
 
 const USER_COLUMNS = "id, email, plan, created_at";
-const JOB_COLUMNS = "id, status, input, video, transcript, translation, error, created_at, finished_at";
+const JOB_COLUMNS = "id, status, input, video, duration_sec, error, created_at, finished_at";
 
 /** Turn a Supabase/PostgREST error into an Error with an HTTP status. */
 function fail(error) {

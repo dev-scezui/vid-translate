@@ -4,8 +4,11 @@ An Express API that takes a public video link (TikTok, YouTube, Instagram, Faceb
 
 1. **Downloads** the media with `yt-dlp` (it grabs an audio-only stream when the site has one)
 2. **Extracts the audio** with `ffmpeg` (mono, 16 kHz, 32 kbps MP3, about 14 MB per hour)
-3. **Transcribes** it with Whisper, through any OpenAI-compatible speech-to-text API (OpenAI, Groq, self-hosted)
-4. **Translates** the transcript with Claude
+3. **Transcribes** it with Whisper, with timestamps, through any OpenAI-compatible speech-to-text API (OpenAI, Groq, self-hosted)
+4. **Translates** it line by line with Claude, keeping each line's timing
+5. **Returns** the result as timestamped text or as downloadable subtitles (`.srt`, `.vtt`, `.txt`)
+
+**Transcripts and translations are never stored.** The result goes back to the client on the request that asked for it, and then it's gone. The database keeps only job metadata (status, video title, duration) for usage limits and history.
 
 ## Requirements
 
@@ -107,11 +110,10 @@ Then subscribe through the UI using the test card `4242 4242 4242 4242`, any fut
 
 The app servers keep no state, so you can run as many as you like behind a load balancer:
 
-- Job status and results are in the database, so any server can answer `GET /api/jobs/:id`.
-- Each server processes the jobs it accepted, up to `MAX_CONCURRENT_JOBS` at a time, using its local disk for temporary files.
+- Each job runs on the server that received the request and streams its result back over that connection, so no shared result storage is needed. Job status is in the database, so any server can answer `GET /api/jobs/:id`.
+- Each server runs up to `MAX_CONCURRENT_JOBS` at a time, using its local disk for temporary files, which are deleted when the job ends.
+- Load balancer idle timeouts must allow for the 15-second keep-alive comments on the event stream (most default to 60 seconds).
 - If a server dies mid-job, a sweep marks the job as failed (which refunds the translation) once it has made no progress for an hour. Every server runs the sweep every 10 minutes, and running it more than once is harmless.
-- `?wait=true` keeps the HTTP request open on the server running the job. For long videos, polling is more robust.
-
 For heavy traffic, the next step is to split API servers from worker servers, with a proper queue between them (for example pg-boss on the same Postgres, or BullMQ with Redis), so a burst of jobs doesn't slow down API responses.
 
 ## API
@@ -151,35 +153,50 @@ Returns `{ url }` for the Stripe Customer Portal.
 - `targetLanguage`: optional, defaults to `"English"`. Any language name works.
 - `sourceLanguage`: optional ISO-639-1 hint. Leave it out to auto-detect.
 
-The response is `202` with a job to poll. Add `?wait=true` to block until the job finishes instead, which is handy for bots and scripts:
+The result comes back on this same request, in one of three ways:
+
+**1. Download subtitles directly:** add `?format=srt`, `vtt` or `txt`:
 
 ```bash
-curl -X POST 'localhost:3000/api/jobs?wait=true' \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $API_KEY" \
-  -d '{"url":"https://youtu.be/jNQXAC9IVRw","targetLanguage":"Spanish"}'
+curl -X POST 'localhost:3000/api/jobs?format=srt' \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer $API_KEY" \
+  -d '{"url":"https://youtu.be/jNQXAC9IVRw","targetLanguage":"Spanish"}' -OJ
 ```
 
-### `GET /api/jobs`
+`&track=` chooses the text: `translation` (the default), `original`, or `bilingual` (translation above the original). Long lines are split into subtitle-sized cues of at most 2 lines of about 42 characters, with the timing shared out.
 
-Your recent jobs, newest first. Use `?limit=` to get up to 100.
-
-### `GET /api/jobs/:id`
-
-`status` moves through `queued` → `fetching_info` → `downloading` → `extracting_audio` → `transcribing` → `translating` → `done`, or ends at `error`.
+**2. JSON** (the default) returns timestamped segments:
 
 ```json
 {
   "id": "…",
-  "status": "done",
   "video": { "title": "…", "platform": "TikTok", "durationSec": 31 },
-  "transcript": { "text": "…", "language": "spanish", "segments": [{ "start": 0, "end": 3.2, "text": "…" }] },
-  "translation": { "language": "English", "text": "…" },
-  "error": null
+  "sourceLanguage": "spanish",
+  "targetLanguage": "English",
+  "segments": [
+    { "start": 0, "end": 3.2, "text": "Hola a todos.", "translation": "Hi everyone." }
+  ],
+  "usage": { … }
 }
 ```
 
-Only the user who created a job can read it. Jobs, including their transcripts and translations, are stored permanently. Add a cleanup job if you'd rather not keep results forever.
+**3. Live progress** with `Accept: text/event-stream` (Server-Sent Events), which the web UI uses:
+
+- `job`: `{ id, usage }`
+- `status`: one per step (`queued`, `fetching_info`, `downloading`, `extracting_audio`, `transcribing`, `translating`)
+- `result`: the same JSON as above, or `error`: `{ error }`
+- `usage`: the updated quota
+
+A comment line is sent every 15 seconds so proxies keep the connection open.
+
+If the client disconnects before the result is ready, the job is cancelled and the translation is refunded. Since nothing is stored, a dropped connection loses the result, so long videos are safer over the event stream. If a job fails, you get `422` with the error, and the translation is refunded.
+
+### `GET /api/jobs` and `GET /api/jobs/:id`
+
+Your job history, newest first (`?limit=` up to 100), and a single job. These return metadata only: URL, target language, status, video title, duration and error. They never include transcripts or translations.
+
+
+Only the user who created a job can read it.
 
 ### Admin endpoints
 
@@ -200,7 +217,7 @@ See `.env.example`. The main settings:
 |---|---|---|
 | `TRANSCRIBE_API_KEY` | `OPENAI_API_KEY` | Speech-to-text key |
 | `TRANSCRIBE_BASE_URL` | OpenAI | For example `https://api.groq.com/openai/v1` |
-| `TRANSCRIBE_MODEL` | `whisper-1` | Whisper models also return timestamps |
+| `TRANSCRIBE_MODEL` | `whisper-1` | Must support `verbose_json` for line-level timestamps (`whisper-1`, Groq `whisper-large-v3*`). `gpt-4o-*-transcribe` works, but gives one cue per 10-minute chunk |
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Translation model |
 | `CLAUDE_EFFORT` | `medium` | `low` is cheaper and faster for casual clips |
 | `ADMIN_TOKEN` | (none) | Required for the admin endpoints |

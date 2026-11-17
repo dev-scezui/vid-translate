@@ -5,6 +5,7 @@ import { config } from "./config.js";
 import { validateVideoUrl } from "./lib/validateUrl.js";
 import { run } from "./lib/exec.js";
 import { createJob } from "./pipeline.js";
+import { FORMATS } from "./lib/subtitles.js";
 import {
   createUser, getJobForUser, getUsage, getUserByEmail, getUserById,
   listJobsForUser, rotateApiKey, setPlan, supabase,
@@ -19,7 +20,10 @@ if (process.env.TRUST_PROXY) app.set("trust proxy", process.env.TRUST_PROXY);
 // Billing first: the Stripe webhook must see the raw, unparsed body.
 app.use(billingRouter);
 app.use(express.json({ limit: "16kb" }));
-app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public")));
+const here = path.dirname(fileURLToPath(import.meta.url));
+app.use(express.static(path.join(here, "..", "public")));
+// The browser builds subtitle files with the same code the server uses.
+app.get("/lib/subtitles.js", (_req, res) => res.type("text/javascript").sendFile(path.join(here, "lib", "subtitles.js")));
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -43,11 +47,24 @@ app.post("/api/me/rotate-key", requireUser, async (req, res) => {
   res.json({ apiKey: await rotateApiKey(req.user.id), note: "Your previous key no longer works." });
 });
 
+const TRACKS = new Set(["translation", "original", "bilingual"]);
+
+function fileName(result, ext, track) {
+  const base = (result.video?.title ?? "video").normalize("NFKD").replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-").slice(0, 60) || "video";
+  const suffix = track === "original" ? result.sourceLanguage ?? "original" : track === "bilingual" ? "bilingual" : result.targetLanguage;
+  return `${base}.${String(suffix).toLowerCase().replace(/[^\w-]/g, "")}.${ext}`;
+}
+
 /**
  * POST /api/jobs
  * body: { url, targetLanguage = "English", sourceLanguage? }
- * Uses one translation from the monthly quota (refunded if the job fails).
- * Returns 202 with a job id to poll. Add ?wait=true to block until it finishes.
+ *
+ * Results are not stored, so they come back on this request:
+ *  - Accept: text/event-stream -> Server-Sent Events: `job`, `status`, then `result` or `error`
+ *  - otherwise waits and returns JSON { id, video, sourceLanguage, targetLanguage, segments }
+ *  - ?format=srt|vtt|txt -> waits and returns that subtitle file as a download
+ *    (&track=translation|original|bilingual, default translation)
+ * Uses one translation from the monthly quota; refunded if the job fails or the client disconnects.
  */
 app.post("/api/jobs", requireUser, async (req, res) => {
   const { url, targetLanguage = "English", sourceLanguage } = req.body ?? {};
@@ -58,18 +75,69 @@ app.post("/api/jobs", requireUser, async (req, res) => {
   if (sourceLanguage != null && !/^[a-z]{2}$/i.test(sourceLanguage)) {
     return res.status(400).json({ error: "`sourceLanguage` must be an ISO-639-1 code, e.g. \"es\"" });
   }
+  const format = req.query.format ? String(req.query.format) : null;
+  const track = String(req.query.track ?? "translation");
+  if (format && !FORMATS[format]) return res.status(400).json({ error: "`format` must be srt, vtt or txt" });
+  if (!TRACKS.has(track)) return res.status(400).json({ error: "`track` must be translation, original or bilingual" });
+  const sse = !format && (req.get("accept") ?? "").includes("text/event-stream");
 
   const safeUrl = await validateVideoUrl(url);
-  const { id, done } = await createJob(req.user, {
-    url: safeUrl,
-    targetLanguage,
-    sourceLanguage: sourceLanguage?.toLowerCase() ?? null,
+
+  // Cancel the job (and refund it) if the client goes away before the result is sent.
+  const abort = new AbortController();
+  res.on("close", () => {
+    if (!res.writableFinished) abort.abort();
   });
 
-  if (req.query.wait === "true") await done;
-  const job = await getJobForUser(id, req.user.id);
-  const status = req.query.wait === "true" ? (job.status === "done" ? 200 : 422) : 202;
-  res.status(status).location(`/api/jobs/${id}`).json({ ...job, usage: await getUsage(req.user.id) });
+  // Events raised before the stream opens (e.g. "fetching_info") are held and sent once it does.
+  let streaming = false;
+  const pending = [];
+  const send = (event, data) => {
+    if (!streaming) return void pending.push([event, data]);
+    if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  const { id, result } = await createJob(
+    req.user,
+    { url: safeUrl, targetLanguage, sourceLanguage: sourceLanguage?.toLowerCase() ?? null },
+    { signal: abort.signal, onStatus: (status, meta) => sse && send("status", { status, video: meta?.video }) },
+  );
+
+  if (sse) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no", // don't let nginx buffer the stream
+    });
+    streaming = true;
+    send("job", { id, usage: await getUsage(req.user.id) });
+    for (const [event, data] of pending.splice(0)) send(event, data);
+    const ping = setInterval(() => !res.writableEnded && res.write(": ping\n\n"), 15_000); // keeps proxies from timing out
+    try {
+      send("result", await result);
+    } catch (err) {
+      send("error", { error: err.message });
+    } finally {
+      clearInterval(ping);
+      if (!res.writableEnded) {
+        send("usage", await getUsage(req.user.id).catch(() => null));
+        res.end();
+      }
+    }
+    return;
+  }
+
+  let out;
+  try {
+    out = await result;
+  } catch (err) {
+    return res.status(422).json({ id, error: err.message, usage: await getUsage(req.user.id) });
+  }
+  if (format) {
+    const f = FORMATS[format];
+    res.attachment(fileName(out, f.ext, track)).type(`${f.mime}; charset=utf-8`);
+    return res.send(f.render(out.segments, track));
+  }
+  res.json({ ...out, usage: await getUsage(req.user.id) });
 });
 
 app.get("/api/jobs", requireUser, async (req, res) => {
@@ -77,6 +145,7 @@ app.get("/api/jobs", requireUser, async (req, res) => {
   res.json(await listJobsForUser(req.user.id, limit));
 });
 
+/** Job metadata only (status, video, timing). Transcripts and translations are never stored. */
 app.get("/api/jobs/:id", requireUser, async (req, res) => {
   const job = /^[0-9a-f-]{36}$/i.test(req.params.id) && (await getJobForUser(req.params.id, req.user.id));
   if (!job) return res.status(404).json({ error: "Job not found" });
