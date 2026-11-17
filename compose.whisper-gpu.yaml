@@ -1,0 +1,18 @@
+# NVIDIA GPU for the self-hosted Whisper server. Needs the NVIDIA Container Toolkit.
+#
+#   docker compose -f compose.yaml -f compose.whisper.yaml -f compose.whisper-gpu.yaml up --build
+#
+# With a GPU, a larger model is fast enough: set WHISPER_MODEL=Systran/faster-whisper-large-v3 in .env.
+
+services:
+  whisper:
+    image: ghcr.io/speaches-ai/speaches:${WHISPER_IMAGE_TAG:-0.9.0-rc.3-cuda-12.6.3}
+    environment:
+      WHISPER__INFERENCE_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

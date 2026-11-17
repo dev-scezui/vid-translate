@@ -226,6 +226,7 @@ app.get("/health", async (_req, res) => {
     ffmpeg: await check(config.ffmpegPath, ["-version"]),
     database: !(await supabase.from("plans").select("id").limit(1)).error,
     transcriptionKey: Boolean(config.transcription.apiKey),
+    transcriptionEndpoint: config.transcription.baseURL,
     anthropicKey: Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
     stripe: Boolean(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET),
   };

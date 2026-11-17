@@ -1,0 +1,45 @@
+# Self-hosted Whisper (speaches, an OpenAI-compatible faster-whisper server).
+# Layer it on top of compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.whisper.yaml up --build
+#
+# The model is downloaded on first start (Systran/faster-whisper-small is about 0.5 GB)
+# and cached in the hf-hub-cache volume. Pick another with WHISPER_MODEL in .env, e.g.
+# Systran/faster-whisper-medium or, on a GPU, Systran/faster-whisper-large-v3.
+# Nothing is sent to Groq or OpenAI in this setup.
+
+services:
+  whisper:
+    # 0.9.0 is the first release that downloads PRELOAD_MODELS at startup. It is a
+    # release candidate; set WHISPER_IMAGE_TAG to move to a newer tag.
+    image: ghcr.io/speaches-ai/speaches:${WHISPER_IMAGE_TAG:-0.9.0-rc.3-cpu}
+    restart: unless-stopped
+    environment:
+      PRELOAD_MODELS: '["${WHISPER_MODEL:-Systran/faster-whisper-small}"]'
+      STT_MODEL_TTL: "-1"   # keep the model loaded instead of unloading after 5 idle minutes
+      ENABLE_UI: "false"
+      LOG_LEVEL: info
+    volumes:
+      - hf-hub-cache:/home/ubuntu/.cache/huggingface/hub
+    # Not published to the host: only the app talks to it. To try it directly, add:
+    # ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15m   # first start downloads the model
+
+  app:
+    depends_on:
+      whisper:
+        condition: service_healthy
+    environment:
+      TRANSCRIBE_BASE_URL: http://whisper:8000/v1
+      TRANSCRIBE_API_KEY: not-needed   # speaches has no API key unless you set API_KEY on it
+      TRANSCRIBE_MODEL: ${WHISPER_MODEL:-Systran/faster-whisper-small}
+      # speaches only returns segment timestamps when asked; Groq/OpenAI don't take this field.
+      TRANSCRIBE_EXTRA_FIELDS: '{"without_timestamps":"false"}'
+
+volumes:
+  hf-hub-cache:

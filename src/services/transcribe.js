@@ -5,16 +5,17 @@ import { config } from "../config.js";
 let client;
 function getClient() {
   if (!config.transcription.apiKey) {
-    throw new Error("Set TRANSCRIBE_API_KEY (or OPENAI_API_KEY) to enable transcription");
+    throw new Error("Set GROQ_API_KEY (or TRANSCRIBE_API_KEY for another provider) to enable transcription");
   }
-  client ??= new OpenAI({ apiKey: config.transcription.apiKey, baseURL: config.transcription.baseURL });
+  // Groq's free tier rate-limits quickly; retry 429s a few more times than the default 2.
+  client ??= new OpenAI({ apiKey: config.transcription.apiKey, baseURL: config.transcription.baseURL, maxRetries: 4 });
   return client;
 }
 
 /**
  * Transcribe audio chunks in order and stitch them together, with timestamps.
  * Timestamps need a model that supports response_format "verbose_json"
- * (whisper-1, Groq's whisper-large-v3*, faster-whisper servers). Models
+ * (Groq's whisper-large-v3*, OpenAI's whisper-1, faster-whisper servers). Models
  * without it (gpt-4o-*-transcribe) get one segment per audio chunk.
  * @param {{file: string, offsetSec: number, durationSec: number}[]} chunks
  * @param {{language?: string, signal?: AbortSignal}} opts language is an ISO-639-1 hint, e.g. "es".
@@ -37,6 +38,7 @@ export async function transcribe(chunks, { language, signal } = {}) {
         response_format: verbose ? "verbose_json" : "json",
         ...(verbose ? { timestamp_granularities: ["segment"] } : {}),
         ...(language ? { language } : {}),
+        ...config.transcription.extraFields,
       },
       { signal },
     );

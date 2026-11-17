@@ -4,7 +4,7 @@ An Express API that takes a public video link (TikTok, YouTube, Instagram, Faceb
 
 1. **Downloads** the media with `yt-dlp` (it grabs an audio-only stream when the site has one)
 2. **Extracts the audio** with `ffmpeg` (mono, 16 kHz, 32 kbps MP3, about 14 MB per hour)
-3. **Transcribes** it with Whisper, with timestamps, through any OpenAI-compatible speech-to-text API (OpenAI, Groq, self-hosted)
+3. **Transcribes** it with Whisper, with timestamps. It uses Groq's hosted Whisper by default, or your own self-hosted Whisper server (see [Docker](#docker)), or any OpenAI-compatible speech-to-text API
 4. **Translates** it line by line with Claude, keeping each line's timing
 5. **Returns** the result as timestamped text or as downloadable subtitles (`.srt`, `.vtt`, `.txt`)
 
@@ -19,9 +19,35 @@ The database also keeps job metadata (status, video title, duration) for usage l
 - Node.js 20+
 - A [Supabase](https://supabase.com) project (the free tier is fine to start)
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp#installation) and `ffmpeg` on `PATH`. Keep yt-dlp updated (`yt-dlp -U`): sites change often.
-- An Anthropic API key (for translation) and a speech-to-text API key (for transcription)
+- An Anthropic API key (for translation) and a [Groq API key](https://console.groq.com/keys) (for transcription). You don't need the Groq key if you self-host Whisper.
 
-Or skip the local installs and use Docker: `docker build -t vid-translate . && docker run --env-file .env -p 3000:3000 vid-translate`
+Or skip the local installs and use Docker (see [Docker](#docker)).
+
+## Docker
+
+Docker Compose files are included:
+
+```bash
+cp .env.example .env    # fill it in
+
+# App only. Transcription goes to Groq.
+docker compose up --build
+
+# App + self-hosted Whisper server (CPU). No audio leaves your servers.
+docker compose -f compose.yaml -f compose.whisper.yaml up --build
+
+# Same, on an NVIDIA GPU (needs the NVIDIA Container Toolkit)
+docker compose -f compose.yaml -f compose.whisper.yaml -f compose.whisper-gpu.yaml up --build
+```
+
+The self-hosted option runs [speaches](https://github.com/speaches-ai/speaches), an open-source, OpenAI-compatible faster-whisper server, next to the app:
+
+- **First start:** the model downloads on first start and is cached in a Docker volume. The app waits until the server is healthy.
+- **Choosing a model:** set `WHISPER_MODEL` in `.env`. `Systran/faster-whisper-small` (the default) is fine on a CPU. `Systran/faster-whisper-large-v3` is the most accurate and needs a GPU to be fast.
+- **Network:** the Whisper server isn't exposed to the outside; only the app can reach it.
+- **Image version:** the image is pinned to `0.9.0-rc.3`, the first release that downloads models at startup. It's a release candidate, so move to a stable tag with `WHISPER_IMAGE_TAG` when one is available.
+
+**Groq or self-hosted?** Groq costs nothing to run and is fast, and you pay per audio minute (its free tier has low rate limits). A self-hosted server has no per-minute cost, but a GPU machine costs the same whether or not it's busy. On a CPU it's free but slow, roughly real-time or slower for the larger models. Start with Groq, and self-host once you have steady volume.
 
 ## Supabase setup
 
@@ -229,9 +255,12 @@ See `.env.example`. The main settings:
 
 | Variable | Default | |
 |---|---|---|
-| `TRANSCRIBE_API_KEY` | `OPENAI_API_KEY` | Speech-to-text key |
-| `TRANSCRIBE_BASE_URL` | OpenAI | For example `https://api.groq.com/openai/v1` |
-| `TRANSCRIBE_MODEL` | `whisper-1` | Must support `verbose_json` for line-level timestamps (`whisper-1`, Groq `whisper-large-v3*`). `gpt-4o-*-transcribe` works, but gives one cue per 10-minute chunk |
+| `GROQ_API_KEY` | (none) | Transcription key for the default provider (Groq) |
+| `TRANSCRIBE_BASE_URL` | `https://api.groq.com/openai/v1` | Any OpenAI-compatible speech-to-text API, for example `https://api.openai.com/v1` |
+| `TRANSCRIBE_API_KEY` | `GROQ_API_KEY` | Key for a non-Groq provider |
+| `TRANSCRIBE_MODEL` | `whisper-large-v3-turbo` | Must support `verbose_json` for line-level timestamps (Groq `whisper-large-v3*`, OpenAI `whisper-1`, faster-whisper models). OpenAI's `gpt-4o-*-transcribe` works, but gives one cue per 10-minute chunk |
+| `TRANSCRIBE_EXTRA_FIELDS` | (none) | JSON object of extra form fields to send. The self-hosted compose file sets `{"without_timestamps":"false"}` |
+| `WHISPER_MODEL` / `WHISPER_IMAGE_TAG` | `Systran/faster-whisper-small` / `0.9.0-rc.3-cpu` | Only used by `compose.whisper.yaml` |
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Translation model |
 | `CLAUDE_EFFORT` | `medium` | `low` is cheaper and faster for casual clips |
 | `ADMIN_TOKEN` | (none) | Required for the admin endpoints |
