@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Translate</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1a1a1a; --bg:#fafafa; --muted:#666; --card:#fff; --border:#ddd; --accent:#2457d6; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#121212; --muted:#999; --card:#1d1d1d; --border:#333; --accent:#7aa2ff; } }
+  body { margin:0; font:16px/1.5 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
+  main { max-width:760px; margin:0 auto; padding:32px 16px; }
+  form { display:flex; flex-wrap:wrap; gap:8px; }
+  input, button { font:inherit; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--card); color:var(--fg); }
+  input[name=url] { flex:1 1 320px; } input[name=lang] { width:140px; }
+  button { background:var(--accent); color:#fff; border:none; cursor:pointer; } button:disabled { opacity:.6; }
+  .status { color:var(--muted); margin:16px 0; }
+  section { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; margin-top:16px; white-space:pre-wrap; }
+  h2 { font-size:14px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:0 0 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Video Translate</h1>
+  <p class="status">Paste a public link from TikTok, YouTube, Instagram, Facebook, Threads, X and more.</p>
+  <form id="f">
+    <input name="url" type="url" placeholder="https://..." required>
+    <input name="lang" value="English" aria-label="Target language">
+    <button>Translate</button>
+  </form>
+  <p class="status" id="status"></p>
+  <div id="out"></div>
+</main>
+<script>
+const f = document.getElementById("f"), statusEl = document.getElementById("status"), out = document.getElementById("out");
+const labels = { queued:"Queued…", fetching_info:"Reading link…", downloading:"Downloading…", extracting_audio:"Extracting audio…", transcribing:"Transcribing…", translating:"Translating…" };
+function card(title, text) { const s = document.createElement("section"); const h = document.createElement("h2"); h.textContent = title; s.append(h, text); return s; }
+f.onsubmit = async (e) => {
+  e.preventDefault(); out.innerHTML = ""; f.querySelector("button").disabled = true;
+  try {
+    let r = await fetch("/api/jobs", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ url: f.url.value, targetLanguage: f.lang.value }) });
+    let job = await r.json(); if (!r.ok) throw new Error(job.error);
+    while (!["done","error"].includes(job.status)) {
+      statusEl.textContent = labels[job.status] ?? job.status;
+      await new Promise((res) => setTimeout(res, 2000));
+      job = await (await fetch("/api/jobs/" + job.id)).json();
+    }
+    if (job.status === "error") throw new Error(job.error);
+    statusEl.textContent = job.video?.title ?? "Done";
+    out.append(card("Translation (" + job.translation.language + ")", job.translation.text),
+               card("Original transcript" + (job.transcript.language ? " (" + job.transcript.language + ")" : ""), job.transcript.text));
+  } catch (err) { statusEl.textContent = "Error: " + err.message; }
+  finally { f.querySelector("button").disabled = false; }
+};
+</script>
+</body>
+</html>
