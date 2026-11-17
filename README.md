@@ -50,8 +50,58 @@ The tiers are rows in the `plans` table. Edit them in the Supabase table editor 
 - **Video length:** checked from the site's metadata before downloading. If the site doesn't report a length, it's checked again on the extracted audio, before any paid transcription.
 - **Storage:** users, plans and jobs live in Supabase. API keys are stored as hashes only. The `jobs` table doubles as the usage ledger: every job that didn't end in `error` counts toward the monthly limit.
 - **Atomic checks:** the quota check and the signup limit run inside Postgres functions with row and advisory locks. They stay correct however many app servers you run. In a test, 20 simultaneous requests from a Free user produced exactly 5 jobs.
-- **Upgrades:** there's no payment integration yet. Change a user's plan with the admin endpoint below, in the Supabase table editor, or by calling `setPlan()` from a payment webhook (for example Stripe).
+- **Upgrades:** handled by Stripe subscriptions (see below). The admin endpoint can still change a plan by hand, for example to give someone free access.
 - **Signup abuse:** limited to 3 signups per IP per day, enforced in the database. Set `TRUST_PROXY` when running behind a load balancer so the real client IP is used.
+
+## Stripe billing
+
+Paid plans are monthly Stripe subscriptions:
+
+1. A user clicks **Upgrade**. `POST /api/billing/checkout` sends them to a Stripe Checkout page.
+2. After they pay, Stripe calls `POST /api/stripe/webhook`. The app fetches the subscription from Stripe and sets the user's plan.
+3. **Manage billing** (`POST /api/billing/portal`) opens Stripe's Customer Portal, where users switch plans, cancel, update their card and download invoices. Each change comes back through the webhook.
+
+How each subscription state maps to a plan:
+
+| Subscription state | Plan |
+|---|---|
+| `active`, `trialing` | The paid plan |
+| `past_due` | The paid plan is kept while Stripe retries the card |
+| `canceled`, `unpaid`, `incomplete_expired` | `free` |
+| Cancelled "at period end" | The paid plan is kept until the period ends, then drops to `free` |
+
+### Setup
+
+1. **Create the products.** In the Stripe dashboard (start in **test mode**), create a product for each paid plan with a recurring monthly price.
+2. **Link the prices.** Copy each price ID into the `plans` table:
+   ```sql
+   update plans set stripe_price_id = 'price_...' where id = 'pro';
+   update plans set stripe_price_id = 'price_...' where id = 'business';
+   ```
+   Amounts and currency come from Stripe, so you change prices there. A plan with no `stripe_price_id`, like `free`, can't be bought.
+3. **Add the webhook.** Under **Developers → Webhooks**, add an endpoint at `https://<your-app>/api/stripe/webhook` with these events:
+   - `checkout.session.completed`
+   - `customer.subscription.created`, `.updated`, `.deleted`, `.paused`, `.resumed`
+
+   Put its signing secret in `STRIPE_WEBHOOK_SECRET`.
+4. **Set up the portal.** Under **Settings → Billing → Customer portal**, enable it, allow customers to switch between your plan products, and allow cancellations.
+5. **Add the keys.** Set `STRIPE_SECRET_KEY` and `APP_URL` in `.env`.
+
+### Testing locally
+
+Install the [Stripe CLI](https://docs.stripe.com/stripe-cli) and run:
+
+```bash
+stripe listen --forward-to localhost:3000/api/stripe/webhook   # prints a whsec_... for STRIPE_WEBHOOK_SECRET
+```
+
+Then subscribe through the UI using the test card `4242 4242 4242 4242`, any future expiry date and any CVC.
+
+### Notes
+
+- The webhook verifies Stripe's signature. It always re-fetches the subscription from Stripe rather than trusting the event body, so retried and out-of-order events are handled safely.
+- If the webhook fails (for example, a price ID isn't linked to a plan), it returns `500` and Stripe retries for up to 3 days.
+- A user with an active subscription who tries to check out again is sent to the portal instead, so nobody gets billed twice.
 
 ## Scaling
 
@@ -82,7 +132,15 @@ Issues a new key. The old key stops working.
 
 ### `GET /api/plans`
 
-Lists the plans and their limits.
+Lists the plans with their limits and their Stripe price (`amount` in cents, `currency`, `interval`).
+
+### `POST /api/billing/checkout`
+
+`{ "plan": "pro" }` returns `{ url }` for a Stripe Checkout page. Returns `409` if you're already subscribed; use the portal instead.
+
+### `POST /api/billing/portal`
+
+Returns `{ url }` for the Stripe Customer Portal.
 
 ### `POST /api/jobs`
 
@@ -147,6 +205,8 @@ See `.env.example`. The main settings:
 | `CLAUDE_EFFORT` | `medium` | `low` is cheaper and faster for casual clips |
 | `ADMIN_TOKEN` | (none) | Required for the admin endpoints |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | (none) | Required |
+| `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` | (none) | Billing. Without them, paid plans can't be bought |
+| `APP_URL` | `http://localhost:3000` | Where Checkout and the portal send users back to |
 | `MAX_DURATION_SEC` | `3600` | A global cap on video length, applied on top of each plan's limit |
 | `MAX_CONCURRENT_JOBS` | `2` | |
 | `YT_DLP_COOKIES` | (none) | A cookies.txt file, which helps with Instagram and Facebook |

@@ -7,22 +7,23 @@ import { run } from "./lib/exec.js";
 import { createJob } from "./pipeline.js";
 import {
   createUser, getJobForUser, getUsage, getUserByEmail, getUserById,
-  listJobsForUser, listPlans, rotateApiKey, setPlan, supabase,
+  listJobsForUser, rotateApiKey, setPlan, supabase,
 } from "./store.js";
 import { requireAdmin, requireUser } from "./auth.js";
+import { billingRouter } from "./billing.js";
 
 // Express 5 forwards errors from async handlers to the error middleware.
 const app = express();
 // Set TRUST_PROXY (e.g. "1") behind a load balancer so req.ip is the client's IP.
 if (process.env.TRUST_PROXY) app.set("trust proxy", process.env.TRUST_PROXY);
+// Billing first: the Stripe webhook must see the raw, unparsed body.
+app.use(billingRouter);
 app.use(express.json({ limit: "16kb" }));
 app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public")));
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // ---- Public -----------------------------------------------------------------
-
-app.get("/api/plans", async (_req, res) => res.json(await listPlans()));
 
 /** POST /api/signup { email } -> a free-plan API key (returned once). */
 app.post("/api/signup", async (req, res) => {
@@ -83,7 +84,7 @@ app.get("/api/jobs/:id", requireUser, async (req, res) => {
 });
 
 // ---- Admin (Authorization: Bearer $ADMIN_TOKEN) -----------------------------
-// Hook a payment provider's webhook up to setPlan() to automate upgrades.
+// Manual overrides (e.g. comp accounts). Paying users' plans are set by the Stripe webhook.
 
 app.get("/api/admin/users", requireAdmin, async (req, res) => {
   const user = req.query.email ? await getUserByEmail(String(req.query.email)) : await getUserById(String(req.query.id ?? ""));
@@ -107,6 +108,7 @@ app.get("/health", async (_req, res) => {
     database: !(await supabase.from("plans").select("id").limit(1)).error,
     transcriptionKey: Boolean(config.transcription.apiKey),
     anthropicKey: Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+    stripe: Boolean(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET),
   };
   const ok = deps.ytDlp && deps.ffmpeg && deps.database;
   res.status(ok ? 200 : 503).json({ ok, deps });

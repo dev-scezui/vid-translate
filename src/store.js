@@ -42,7 +42,7 @@ const newApiKey = () => `vt_${crypto.randomBytes(24).toString("base64url")}`;
 // ---- Plans -----------------------------------------------------------------
 
 export const listPlans = () =>
-  q(supabase.from("plans").select("id, name, max_video_sec, monthly_translations").order("sort"));
+  q(supabase.from("plans").select("id, name, max_video_sec, monthly_translations, stripe_price_id").order("sort"));
 
 // ---- Users -----------------------------------------------------------------
 
@@ -101,3 +101,33 @@ export const listJobsForUser = (userId, limit = 20) =>
 
 /** Fail (and so refund) jobs whose server died mid-run. Safe to call from every instance. */
 export const failStaleJobs = () => q(supabase.rpc("fail_stale_jobs"));
+
+// ---- Billing -----------------------------------------------------------------
+
+const BILLING_COLUMNS = "id, email, plan, stripe_customer_id, stripe_subscription_id, subscription_status";
+
+export const getBillingUser = (id) =>
+  q(supabase.from("users").select(BILLING_COLUMNS).eq("id", id).maybeSingle());
+
+export const getPlanById = (id) =>
+  q(supabase.from("plans").select("id, name, stripe_price_id").eq("id", id).maybeSingle());
+
+/** Save the Stripe customer id unless one is already set; returns the stored id. */
+export async function saveStripeCustomer(userId, customerId) {
+  await q(supabase.from("users").update({ stripe_customer_id: customerId }).eq("id", userId).is("stripe_customer_id", null));
+  return (await getBillingUser(userId)).stripe_customer_id;
+}
+
+/** Apply a Stripe subscription's current state to its user (sets the plan). */
+export const applySubscription = (s) =>
+  q(
+    supabase.rpc("apply_subscription", {
+      p_user_id: s.userId ?? null,
+      p_customer_id: s.customerId,
+      p_subscription_id: s.subscriptionId,
+      p_status: s.status,
+      p_price_id: s.priceId ?? null,
+      p_period_end: s.periodEnd ?? null,
+      p_cancel_at_period_end: s.cancelAtPeriodEnd ?? false,
+    }),
+  );

@@ -16,6 +16,12 @@
   button { background:var(--accent); color:#fff; border:none; cursor:pointer; } button:disabled { opacity:.6; }
   .status { color:var(--muted); margin:16px 0; }
   section { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; margin-top:16px; white-space:pre-wrap; }
+  .plans { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:12px; margin:16px 0; }
+  .plan { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px; white-space:normal; margin:0; }
+  .plan.current { border-color:var(--accent); }
+  .plan b { display:block; font-size:18px; } .plan .price { font-size:20px; margin:4px 0; } .plan ul { padding-left:18px; margin:8px 0; color:var(--muted); font-size:14px; }
+  .plan button { width:100%; }
+  .notice { padding:10px 12px; border-radius:8px; background:var(--card); border:1px solid var(--accent); }
   h2 { font-size:14px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:0 0 8px; }
 </style>
 </head>
@@ -23,7 +29,9 @@
 <main>
   <h1>Video Translate</h1>
   <p class="status">Paste a public link from TikTok, YouTube, Instagram, Facebook, Threads, X and more.</p>
+  <p class="notice" id="notice" hidden></p>
   <div id="account" class="status"></div>
+  <div class="plans" id="plans" hidden></div>
   <form id="signup" hidden>
     <input name="email" type="email" placeholder="you@example.com" required>
     <button>Get free API key</button>
@@ -44,18 +52,64 @@ const store = { get() { try { return localStorage.getItem(KEY); } catch { return
 let apiKey = store.get();
 const accountEl = document.getElementById("account"), signup = document.getElementById("signup");
 const auth = () => ({ Authorization: "Bearer " + apiKey });
-function showUsage(u) {
-  accountEl.textContent = `${u.planName} plan · ${u.remaining}/${u.monthlyTranslations} translations left this month · videos up to ${Math.round(u.maxVideoSec / 60)} min `;
-  const out = document.createElement("button"); out.textContent = "Sign out"; out.style.padding = "2px 8px";
-  out.onclick = () => { store.set(null); apiKey = null; refresh(); }; accountEl.append(out);
+const plansEl = document.getElementById("plans"), noticeEl = document.getElementById("notice");
+let currentUsage = null;
+function smallButton(label, onclick) { const b = document.createElement("button"); b.textContent = label; b.style.padding = "2px 8px"; b.style.marginLeft = "6px"; b.onclick = onclick; return b; }
+async function goTo(endpoint, body) {
+  const r = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json", ...auth() }, body: JSON.stringify(body ?? {}) });
+  const j = await r.json(); if (!r.ok) { alert(j.error); return; }
+  location.href = j.url;
 }
+function showUsage(u) {
+  currentUsage = u;
+  const sub = u.subscription;
+  let line = `${u.planName} plan · ${u.remaining}/${u.monthlyTranslations} translations left this month · videos up to ${Math.round(u.maxVideoSec / 60)} min`;
+  if (sub?.cancelAtPeriodEnd && sub.currentPeriodEnd) line += ` · ends ${new Date(sub.currentPeriodEnd).toLocaleDateString()}`;
+  if (sub?.status === "past_due") line += " · payment failed, please update your card";
+  accountEl.textContent = line + " ";
+  if (sub) accountEl.append(smallButton("Manage billing", () => goTo("/api/billing/portal")));
+  accountEl.append(smallButton("Sign out", () => { store.set(null); apiKey = null; refresh(); }));
+  renderPlans();
+}
+let plans = [];
+function fmtPrice(p) {
+  if (!p) return "Free";
+  return new Intl.NumberFormat(undefined, { style: "currency", currency: p.currency }).format(p.amount / 100) + (p.interval ? " / " + p.interval : "");
+}
+function renderPlans() {
+  plansEl.innerHTML = ""; plansEl.hidden = !apiKey || !plans.length;
+  const subscribed = ["active", "trialing", "past_due"].includes(currentUsage?.subscription?.status);
+  for (const p of plans) {
+    const card = document.createElement("section"); card.className = "plan" + (currentUsage?.plan === p.id ? " current" : "");
+    const name = document.createElement("b"); name.textContent = p.name;
+    const price = document.createElement("div"); price.className = "price"; price.textContent = p.price ? fmtPrice(p.price) : (p.purchasable ? "" : "Free");
+    const ul = document.createElement("ul");
+    for (const t of [`${p.monthly_translations} translations / month`, `Videos up to ${Math.round(p.max_video_sec / 60)} min`]) { const li = document.createElement("li"); li.textContent = t; ul.append(li); }
+    card.append(name, price, ul);
+    if (currentUsage?.plan === p.id) { const b = document.createElement("button"); b.textContent = "Current plan"; b.disabled = true; card.append(b); }
+    else if (p.purchasable) {
+      const b = document.createElement("button"); b.textContent = subscribed ? "Switch plan" : "Upgrade";
+      b.onclick = () => subscribed ? goTo("/api/billing/portal") : goTo("/api/billing/checkout", { plan: p.id });
+      card.append(b);
+    }
+    plansEl.append(card);
+  }
+}
+const params = new URLSearchParams(location.search);
+if (params.get("checkout")) {
+  noticeEl.hidden = false;
+  noticeEl.textContent = params.get("checkout") === "success" ? "Thanks! Your plan is being activated. It can take a few seconds to show up." : "Checkout cancelled. You haven't been charged.";
+  history.replaceState(null, "", location.pathname);
+  if (params.get("checkout") === "success") setTimeout(refresh, 4000);
+}
+fetch("/api/plans").then((r) => r.ok ? r.json() : []).then((p) => { plans = p; renderPlans(); }).catch(() => {});
 async function refresh() {
   if (apiKey) {
     const r = await fetch("/api/me", { headers: auth() });
     if (r.ok) { showUsage((await r.json()).usage); signup.hidden = true; f.hidden = false; return; }
     store.set(null); apiKey = null;
   }
-  accountEl.textContent = "Sign up for a free key to start translating."; signup.hidden = false; f.hidden = true;
+  accountEl.textContent = "Sign up for a free key to start translating."; signup.hidden = false; f.hidden = true; plansEl.hidden = true;
 }
 signup.onsubmit = async (e) => {
   e.preventDefault();
